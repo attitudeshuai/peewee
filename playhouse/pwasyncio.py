@@ -850,21 +850,29 @@ class AsyncSqliteDatabase(AsyncDatabaseMixin, SqliteDatabase):
         return await pool.initialize()
 
     async def _add_conn_hooks(self, conn):
-        if self._attached:
-            await self._attach_databases(conn)
-        if self._pragmas:
-            await self._set_pragmas(conn)
-        if self._aggregates:
-            await self._load_aggregates(conn)
-        if self._collations:
-            await self._load_collations(conn)
-        if self._functions:
-            await self._load_functions(conn)
-        if self._window_functions and \
-           aiosqlite.sqlite_version_info >= (3, 25, 0):
-            await self._load_window_functions(conn)
-        if self._extensions:
-            await self._load_extensions(conn)
+        # Tracked with a weak reference (the wrapper is released by the pool
+        # on close) and loaded from an atomic snapshot.
+        snapshot = self._ext.begin_connect(conn, weak=True)
+        try:
+            if self._attached:
+                await self._attach_databases(conn)
+            if self._pragmas:
+                await self._set_pragmas(conn)
+            if snapshot.get('aggregate'):
+                await self._load_aggregates(conn, snapshot['aggregate'])
+            if snapshot.get('collation'):
+                await self._load_collations(conn, snapshot['collation'])
+            if snapshot.get('function'):
+                await self._load_functions(conn, snapshot['function'])
+            if snapshot.get('window') and \
+               aiosqlite.sqlite_version_info >= (3, 25, 0):
+                await self._load_window_functions(conn, snapshot['window'])
+            if self._extensions:
+                await self._load_extensions(conn)
+        except BaseException:
+            self._ext.connect_failed(conn)
+            raise
+        return snapshot
 
     async def _attach_databases(self, conn):
         for name, db in self._attached.items():
@@ -874,24 +882,24 @@ class AsyncSqliteDatabase(AsyncDatabaseMixin, SqliteDatabase):
         for pragma, value in self._pragmas:
             await conn.execute('PRAGMA %s = %s;' % (pragma, value))
 
-    async def _load_aggregates(self, conn):
+    async def _load_aggregates(self, conn, items):
         # aiosqlite exposes no create_aggregate - run it on the worker
         # thread against the raw sqlite3 connection.
-        for name, (klass, num_params) in self._aggregates.items():
+        for name, (klass, num_params) in items.items():
             await conn._execute(
                 conn._conn.create_aggregate, name, num_params, klass)
 
-    async def _load_collations(self, conn):
-        for name, fn in self._collations.items():
+    async def _load_collations(self, conn, items):
+        for name, fn in items.items():
             await conn._execute(conn._conn.create_collation, name, fn)
 
-    async def _load_functions(self, conn):
-        for name, (fn, n_params, deterministic) in self._functions.items():
+    async def _load_functions(self, conn, items):
+        for name, (fn, n_params, deterministic) in items.items():
             kwargs = {'deterministic': deterministic} if deterministic else {}
             await conn.create_function(name, n_params, fn, **kwargs)
 
-    async def _load_window_functions(self, conn):
-        for name, (klass, num_params) in self._window_functions.items():
+    async def _load_window_functions(self, conn, items):
+        for name, (klass, num_params) in items.items():
             await conn._execute(
                 conn._conn.create_window_function, name, num_params, klass)
 

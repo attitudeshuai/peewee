@@ -26,6 +26,7 @@ import time
 import types
 import uuid
 import warnings
+import weakref
 
 try:
     from pysqlite3 import dbapi2 as pysq3
@@ -106,6 +107,9 @@ __all__ = [
     'DQ',
     'Entity',
     'EXCLUDED',
+    'ExtensionConflict',
+    'ExtensionRegistration',
+    'ExtensionUnregisterRejected',
     'Field',
     'FixedCharField',
     'FloatField',
@@ -147,6 +151,11 @@ __all__ = [
     'TimeField',
     'TimestampField',
     'Tuple',
+    'UNREGISTER_PENDING',
+    'UNREGISTER_REBUILD',
+    'UNREGISTER_REJECT',
+    'UNREGISTER_REMOVE',
+    'UnregisterReport',
     'UUIDField',
     'Value',
     'ValuesList',
@@ -3875,10 +3884,19 @@ class Database(_callable_context_manager):
 
     def dispose(self):
         with self._lock:
+            conn = self._state.conn
             self._state.reset()
+            registry = getattr(self, '_ext', None)
+            if registry is not None and conn is not None:
+                registry.untrack(conn)
 
     def _close(self, conn):
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            registry = getattr(self, '_ext', None)
+            if registry is not None:
+                registry.untrack(conn)
 
     def is_closed(self):
         return self._state.closed
@@ -4203,6 +4221,444 @@ def __pragma__(name):
     return property(__get__, __set__)
 
 
+# USER-DEFINED EXTENSION LIFECYCLE.
+#
+# Five kinds of SQLite extensions are supported: scalar functions,
+# aggregates, collations, window functions and virtual-table modules. Each
+# lives in an explicit per-database registry ("what should be installed")
+# that is applied atomically to every connection ("what is installed").
+# Registration, removal and connection-establishment share one ordering,
+# so the registry and the connections cannot silently diverge.
+
+# Disposition of an entry removed from the registry while connections that
+# carry it are still open.
+UNREGISTER_PENDING = 'pending'   # Default: keep on open conns, drop on rebuild.
+UNREGISTER_REMOVE = 'remove'     # Physically remove where the backend allows.
+UNREGISTER_REBUILD = 'rebuild'   # Remove, or rebuild connections that cannot.
+UNREGISTER_REJECT = 'reject'     # Fail unless every open connection can remove.
+
+_EXTENSION_POLICIES = (UNREGISTER_PENDING, UNREGISTER_REMOVE,
+                       UNREGISTER_REBUILD, UNREGISTER_REJECT)
+
+
+class ExtensionConflict(ProgrammingError):
+    """A different implementation is already registered under that name."""
+
+
+class ExtensionUnregisterRejected(ProgrammingError):
+    """Reject-policy: removal cannot be guaranteed on every connection."""
+
+
+class ExtensionRegistration(object):
+    """Outcome of registering a single extension."""
+    __slots__ = ('kind', 'name', 'status', 'applied')
+
+    def __init__(self, kind, name, status, applied):
+        self.kind = kind
+        self.name = name
+        # One of "registered", "replaced" or "present".
+        self.status = status
+        # Whether the extension was (re-)applied to a live connection.
+        self.applied = applied
+
+    def __bool__(self):
+        return True
+
+    def __repr__(self):
+        return ('<ExtensionRegistration: %s %r %s applied=%s>' %
+                (self.kind, self.name, self.status, self.applied))
+
+
+class UnregisterReport(object):
+    """Explicit, per-connection result of removing an extension.
+
+    Nothing here is silent: every tracked connection that still carries the
+    removed implementation is listed in "pending"; every disposition that
+    could not be fulfilled is listed with its reason in "failed".
+    """
+    __slots__ = ('kind', 'name', 'policy', 'found', 'removed', 'pending',
+                 'rebuilt', 'failed')
+
+    def __init__(self, kind, name, policy):
+        self.kind = kind
+        self.name = name
+        self.policy = policy
+        self.found = False
+        self.removed = []    # Connection ids that were physically cleared.
+        self.pending = []    # Connection ids still carrying it (tracked).
+        self.rebuilt = []    # Connection ids rebuilt in order to clear it.
+        self.failed = []     # (connection id, reason) tuples.
+
+    @property
+    def complete(self):
+        return self.found and not self.pending and not self.failed
+
+    def __bool__(self):
+        return self.found and not self.failed
+
+    def __repr__(self):
+        return ('<UnregisterReport: %s %r policy=%s found=%s removed=%s '
+                'pending=%s rebuilt=%s failed=%s>' % (
+                    self.kind, self.name, self.policy, self.found,
+                    self.removed, self.pending, self.rebuilt,
+                    self.failed))
+
+
+class _TrackedConnection(object):
+    __slots__ = ('_ref', '_weak', 'owner', 'pending', 'unsupported')
+
+    def __init__(self, conn, use_weakref=False, finalizer=None):
+        self._weak = use_weakref
+        if use_weakref:
+            self._ref = weakref.ref(conn, finalizer)
+        else:
+            self._ref = conn
+        self.owner = threading.get_ident()
+        # (kind, name) entries removed from the registry while they are still
+        # physically present on this connection -- an explicit pending state.
+        self.pending = set()
+        self.unsupported = set()
+
+    def get(self):
+        if self._weak:
+            return self._ref()
+        return self._ref
+
+
+class _ExtensionRegistry(object):
+    # kind -> name of the backing dict on the database.
+    _KIND_ATTR = (
+        ('function', '_functions'),
+        ('aggregate', '_aggregates'),
+        ('collation', '_collations'),
+        ('window', '_window_functions'),
+        ('module', '_modules'))
+    _ATTR = dict(_KIND_ATTR)
+    # kind -> per-item loader method on the database.
+    _KIND_LOADER = {
+        'function': '_load_functions',
+        'aggregate': '_load_aggregates',
+        'collation': '_load_collations',
+        'window': '_load_window_functions',
+        'module': '_load_modules'}
+
+    def __init__(self, db):
+        self.db = db
+        self._lock = threading.RLock() if db.thread_safe else _NoopLock()
+        self._conns = {}                 # id(conn) -> _TrackedConnection
+        self._remove_caps = {}           # kind -> bool cached probe result
+        self._probe_counter = itertools.count()
+        # Driver permits changing connections owned by other threads (APSW).
+        self.cross_thread = False
+
+    # -- Connection tracking ------------------------------------------------
+
+    def begin_connect(self, conn, weak=False):
+        """Track a new connection and return an atomic snapshot to load."""
+        with self._lock:
+            key = id(conn)
+            finalizer = None
+            if weak:
+                def finalizer(ref, key=key):
+                    with self._lock:
+                        self._conns.pop(key, None)
+            self._conns[key] = _TrackedConnection(conn, weak, finalizer)
+            return self._snapshot()
+
+    def connect_failed(self, conn):
+        """A connection whose hook installation failed must not be tracked."""
+        with self._lock:
+            self._conns.pop(id(conn), None)
+
+    def untrack(self, conn):
+        with self._lock:
+            self._conns.pop(id(conn), None)
+
+    def _snapshot(self):
+        data = {}
+        for kind, attr in self._KIND_ATTR:
+            store = getattr(self.db, attr, None)
+            if store is not None:
+                data[kind] = dict(store)
+        return data
+
+    def _live(self):
+        dead = []
+        live = []
+        for key, rec in self._conns.items():
+            conn = rec.get()
+            if conn is None:
+                dead.append(key)
+            else:
+                live.append((key, rec, conn))
+        for key in dead:
+            self._conns.pop(key, None)
+        return live
+
+    # -- Registration -------------------------------------------------------
+
+    def register(self, kind, name, payload, override=False):
+        db = self.db
+        with self._lock:
+            store = getattr(db, self._ATTR[kind])
+            existing = store.get(name)
+            if existing is not None:
+                if existing == payload:
+                    status = 'present'
+                elif override:
+                    status = 'replaced'
+                else:
+                    raise ExtensionConflict(
+                        '%s "%s" is already registered with a different '
+                        'implementation. Specify override=True to replace it.'
+                        % (kind, name))
+            else:
+                status = 'registered'
+            store[name] = payload
+
+            applied = False
+            conn = self._current_conn()
+            if conn is not None:
+                rec = self._conns.get(id(conn))
+                if rec is not None and self._can_touch(rec):
+                    applied = self._install(kind, name, payload, conn, rec)
+        return ExtensionRegistration(kind, name, status, applied)
+
+    def _current_conn(self):
+        db = self.db
+        if db.is_closed():
+            return None
+        return db._state.conn
+
+    def _can_touch(self, rec):
+        return self.cross_thread or rec.owner == threading.get_ident()
+
+    def _install(self, kind, name, payload, conn, rec):
+        loader = getattr(self.db, self._KIND_LOADER[kind])
+        try:
+            loader(conn, {name: payload})
+        except Exception as exc:
+            if self._is_capability_error(exc):
+                rec.unsupported.add(kind)
+                return False
+            self._raise_as_peewee(exc)
+        return True
+
+    @staticmethod
+    def _is_capability_error(exc):
+        if isinstance(exc, AttributeError):
+            return True
+        if type(exc).__name__ == 'NotSupportedError':
+            return True
+        return False
+
+    @staticmethod
+    def _raise_as_peewee(exc):
+        with __exception_wrapper__:
+            raise exc
+
+    # -- Removal ------------------------------------------------------------
+
+    def unregister(self, kind, name, policy=UNREGISTER_PENDING):
+        if policy not in _EXTENSION_POLICIES:
+            raise ValueError('invalid extension unregister policy %r, must '
+                             'be one of %s' % (policy, _EXTENSION_POLICIES))
+        report = UnregisterReport(kind, name, policy)
+        with self._lock:
+            store = getattr(self.db, self._ATTR[kind], None)
+            if not store or name not in store:
+                return report
+            payload = store.pop(name)
+            report.found = True
+
+            if policy == UNREGISTER_REJECT:
+                # Restore; _reject() pops again only after a successful check.
+                store[name] = payload
+                self._reject(kind, name, payload, store, report)
+                return report
+
+            # Every live connection is explicitly pending until proven
+            # otherwise -- there is no silent divergence.
+            targets = self._live()
+            for key, rec, conn in targets:
+                rec.pending.add((kind, name))
+                report.pending.append(key)
+
+        if policy == UNREGISTER_PENDING:
+            return report
+
+        self._apply_removal(kind, name, payload, policy, targets, report)
+        return report
+
+    def _reject(self, kind, name, payload, store, report):
+        with self._lock:
+            targets = self._live()
+            # Atomic preflight: every connection must be modifiable and
+            # physically removable.
+            for key, rec, conn in targets:
+                if not self._can_touch(rec):
+                    raise ExtensionUnregisterRejected(
+                        '%s "%s" is still installed on connection %s, which '
+                        'cannot be modified from this thread.'
+                        % (kind, name, key))
+                if not self._removal_supported(kind, rec, conn):
+                    raise ExtensionUnregisterRejected(
+                        '%s "%s" is still installed on connection %s, but '
+                        'the backend cannot remove it at runtime.'
+                        % (kind, name, key))
+            # Preflight passed -- removal proceeds without further checks.
+            store.pop(name)
+            for key, rec, conn in targets:
+                try:
+                    self._unload(kind, conn, name, payload)
+                except Exception as exc:
+                    # Not expected after the probe; keep it decidable.
+                    report.failed.append((key, '%s: %s' % (
+                        type(exc).__name__, exc)))
+                    continue
+                rec.pending.discard((kind, name))
+                report.removed.append(key)
+
+    def _apply_removal(self, kind, name, payload, policy, targets, report):
+        for key, rec, conn in targets:
+            if not self._can_touch(rec):
+                if policy == UNREGISTER_REBUILD:
+                    report.failed.append(
+                        (key, 'connection belongs to another thread'))
+                # REMOVE: pending is the documented disposition.
+                continue
+
+            try:
+                with self._lock:
+                    supported = self._removal_supported(kind, rec, conn)
+            except Exception as exc:
+                report.failed.append((key, '%s: %s' % (
+                    type(exc).__name__, exc)))
+                continue
+
+            if supported:
+                try:
+                    self._unload(kind, conn, name, payload)
+                except Exception as exc:
+                    report.failed.append((key, '%s: %s' % (
+                        type(exc).__name__, exc)))
+                    continue
+                with self._lock:
+                    rec.pending.discard((kind, name))
+                report.removed.append(key)
+            elif policy == UNREGISTER_REMOVE:
+                continue  # Stays explicitly pending.
+            elif policy == UNREGISTER_REBUILD:
+                ok, reason = self._rebuild(rec, conn)
+                if ok:
+                    report.rebuilt.append(key)
+                else:
+                    report.failed.append((key, reason))
+
+        # Reconcile: pending lists exactly the connections still carrying it.
+        with self._lock:
+            pending = []
+            for key in report.pending:
+                rec = self._conns.get(key)
+                if rec is not None and (kind, name) in rec.pending:
+                    pending.append(key)
+            report.pending = pending
+
+    def _rebuild(self, rec, conn):
+        db = self.db
+        try:
+            if db.is_closed() or db._state.conn is not conn:
+                return False, 'connection is not the active one for this thread'
+            if db.in_transaction():
+                return False, 'cannot rebuild connection while a ' \
+                              'transaction is open'
+            db.close()
+        except Exception as exc:
+            return False, 'failed to close connection for rebuild: %s' % exc
+        try:
+            db.connect()
+        except Exception as exc:
+            return False, ('connection was closed for rebuild but could not '
+                           'be re-opened: %s: %s' %
+                           (type(exc).__name__, exc))
+        return True, None
+
+    def _unload(self, kind, conn, name, payload):
+        self.db._unload_extension(kind, conn, name, payload)
+
+    # -- Capability probing -------------------------------------------------
+
+    def _removal_supported(self, kind, rec, conn):
+        result = self._remove_caps.get(kind)
+        if result is not None:
+            return result
+        result = self._probe_removal(kind, conn)
+        self._remove_caps[kind] = result
+        return result
+
+    def _probe_removal(self, kind, conn):
+        name = '__pw_ext_probe_%d__' % next(self._probe_counter)
+        try:
+            if kind == 'function':
+                def _probe_fn():
+                    return None
+                conn.create_function(name, 0, _probe_fn)
+                conn.execute('SELECT "%s"()' % name).fetchone()
+                conn.create_function(name, 0, None)
+                verify = 'SELECT "%s"()' % name
+            elif kind == 'aggregate':
+                class _ProbeAgg(object):
+                    def step(self):
+                        pass
+                    def finalize(self):
+                        return None
+                conn.create_aggregate(name, 0, _ProbeAgg)
+                conn.execute('SELECT "%s"()' % name).fetchone()
+                conn.create_aggregate(name, 0, None)
+                verify = 'SELECT "%s"()' % name
+            elif kind == 'collation':
+                conn.create_collation(name, lambda a, b: 0)
+                conn.execute('SELECT 1 ORDER BY 1 COLLATE "%s"'
+                             % name).fetchall()
+                conn.create_collation(name, None)
+                verify = 'SELECT 1 ORDER BY 1 COLLATE "%s"' % name
+            elif kind == 'window':
+                class _ProbeWindow(object):
+                    def __init__(self):
+                        self.value_ = 0
+                    def step(self):
+                        pass
+                    def inverse(self):
+                        pass
+                    def value(self):
+                        return self.value_
+                    def finalize(self):
+                        return self.value_
+                conn.create_window_function(name, 0, _ProbeWindow)
+                conn.execute('SELECT "%s"() OVER ()' % name).fetchall()
+                conn.create_window_function(name, 0, None)
+                verify = 'SELECT "%s"() OVER ()' % name
+            elif kind == 'module':
+                # The default driver has no virtual-table module interface.
+                return False
+            else:
+                return False
+
+            try:
+                conn.execute(verify).fetchall()
+            except Exception as exc:
+                if 'no such' in str(exc).lower():
+                    return True
+                # None was registered as the callback instead of removing.
+                return False
+            # Still callable: runtime removal is not supported.
+            return False
+        except Exception:
+            # Missing method or unusable backend: the decidable result is
+            # "cannot remove at runtime".
+            return False
+
+
 class SqliteDatabase(Database):
     field_types = {
         'BIGAUTO': FIELD.AUTO,
@@ -4238,6 +4694,7 @@ class SqliteDatabase(Database):
         self._window_functions = {}
         self._extensions = set()
         self._attached = {}
+        self._ext = _ExtensionRegistry(self)
         self.nulls_ordering = self.server_version >= (3, 30, 0)
         self.register_function(_sqlite_date_part, 'date_part', 2)
         self.register_function(_sqlite_date_trunc, 'date_trunc', 2)
@@ -4274,17 +4731,29 @@ class SqliteDatabase(Database):
         return conn
 
     def _add_conn_hooks(self, conn):
-        if self._attached:
-            self._attach_databases(conn)
-        if self._pragmas:
-            self._set_pragmas(conn)
-        self._load_aggregates(conn)
-        self._load_collations(conn)
-        self._load_functions(conn)
-        if self.server_version >= (3, 25, 0):
-            self._load_window_functions(conn)
-        if self._extensions:
-            self._load_extensions(conn)
+        # The snapshot is taken atomically under the registry lock, so a
+        # connection never observes a half-completed registration/removal.
+        snapshot = self._ext.begin_connect(conn)
+        try:
+            if self._attached:
+                self._attach_databases(conn)
+            if self._pragmas:
+                self._set_pragmas(conn)
+            self._load_aggregates(conn, snapshot.get('aggregate', ()))
+            self._load_collations(conn, snapshot.get('collation', ()))
+            self._load_functions(conn, snapshot.get('function', ()))
+            if self._window_supported(conn):
+                self._load_window_functions(conn, snapshot.get('window', ()))
+            if self._extensions:
+                self._load_extensions(conn)
+        except BaseException:
+            self._ext.connect_failed(conn)
+            raise
+        return snapshot
+
+    def _window_supported(self, conn):
+        return (self.server_version >= (3, 25, 0)
+                and hasattr(conn, 'create_window_function'))
 
     def _set_pragmas(self, conn):
         cursor = conn.cursor()
@@ -4342,89 +4811,102 @@ class SqliteDatabase(Database):
             # timeout PRAGMA is actually milliseconds.
             self.execute_sql('PRAGMA busy_timeout=%d;' % (seconds * 1000))
 
-    def _load_aggregates(self, conn):
-        for name, (klass, num_params) in self._aggregates.items():
+    def _load_aggregates(self, conn, items):
+        for name, (klass, num_params) in items.items():
             conn.create_aggregate(name, num_params, klass)
 
-    def _load_collations(self, conn):
-        for name, fn in self._collations.items():
+    def _load_collations(self, conn, items):
+        for name, fn in items.items():
             conn.create_collation(name, fn)
 
-    def _load_functions(self, conn):
-        for name, (fn, n_params, deterministic) in self._functions.items():
+    def _load_functions(self, conn, items):
+        for name, (fn, n_params, deterministic) in items.items():
             kwargs = {'deterministic': deterministic} if deterministic else {}
             conn.create_function(name, n_params, fn, **kwargs)
 
-    def _load_window_functions(self, conn):
-        for name, (klass, num_params) in self._window_functions.items():
+    def _load_window_functions(self, conn, items):
+        for name, (klass, num_params) in items.items():
             conn.create_window_function(name, num_params, klass)
 
-    def register_aggregate(self, klass, name=None, num_params=-1):
-        self._aggregates[name or klass.__name__.lower()] = (klass, num_params)
-        if not self.is_closed():
-            self._load_aggregates(self.connection())
+    def register_aggregate(self, klass, name=None, num_params=-1,
+                           override=False):
+        return self._ext.register('aggregate',
+                                  name or klass.__name__.lower(),
+                                  (klass, num_params), override=override)
 
-    def aggregate(self, name=None, num_params=-1):
+    def aggregate(self, name=None, num_params=-1, override=False):
         def decorator(klass):
-            self.register_aggregate(klass, name, num_params)
+            self.register_aggregate(klass, name, num_params, override)
             return klass
         return decorator
 
-    def register_collation(self, fn, name=None):
+    def register_collation(self, fn, name=None, override=False):
         name = name or fn.__name__
         def _collation(*args):
             expressions = args + (SQL('collate %s' % name),)
             return NodeList(expressions)
         fn.collation = _collation
-        self._collations[name] = fn
-        if not self.is_closed():
-            self._load_collations(self.connection())
+        return self._ext.register('collation', name, fn, override=override)
 
-    def collation(self, name=None):
+    def collation(self, name=None, override=False):
         def decorator(fn):
-            self.register_collation(fn, name)
+            self.register_collation(fn, name, override)
             return fn
         return decorator
 
     def register_function(self, fn, name=None, num_params=-1,
-                          deterministic=None):
-        self._functions[name or fn.__name__] = (fn, num_params, deterministic)
-        if not self.is_closed():
-            self._load_functions(self.connection())
+                          deterministic=None, override=False):
+        return self._ext.register('function', name or fn.__name__,
+                                  (fn, num_params, deterministic),
+                                  override=override)
 
-    def func(self, name=None, num_params=-1, deterministic=None):
+    def func(self, name=None, num_params=-1, deterministic=None,
+             override=False):
         def decorator(fn):
-            self.register_function(fn, name, num_params, deterministic)
+            self.register_function(fn, name, num_params, deterministic,
+                                   override)
             return fn
         return decorator
 
-    def register_window_function(self, klass, name=None, num_params=-1):
-        name = name or klass.__name__.lower()
-        self._window_functions[name] = (klass, num_params)
-        if not self.is_closed():
-            self._load_window_functions(self.connection())
+    def register_window_function(self, klass, name=None, num_params=-1,
+                                 override=False):
+        return self._ext.register('window',
+                                  name or klass.__name__.lower(),
+                                  (klass, num_params), override=override)
 
-    def window_function(self, name=None, num_params=-1):
+    def window_function(self, name=None, num_params=-1, override=False):
         def decorator(klass):
-            self.register_window_function(klass, name, num_params)
+            self.register_window_function(klass, name, num_params, override)
             return klass
         return decorator
 
-    def unregister_aggregate(self, name):
-        del(self._aggregates[name])
+    def unregister_aggregate(self, name, policy=UNREGISTER_PENDING):
+        return self._ext.unregister('aggregate', name, policy)
 
-    def unregister_collation(self, name):
-        del(self._collations[name])
+    def unregister_collation(self, name, policy=UNREGISTER_PENDING):
+        return self._ext.unregister('collation', name, policy)
 
-    def unregister_function(self, name):
-        del(self._functions[name])
+    def unregister_function(self, name, policy=UNREGISTER_PENDING):
+        return self._ext.unregister('function', name, policy)
 
-    def unregister_window_function(self, name):
-        del(self._window_functions[name])
+    def unregister_window_function(self, name, policy=UNREGISTER_PENDING):
+        return self._ext.unregister('window', name, policy)
+
+    def _unload_extension(self, kind, conn, name, payload):
+        if kind == 'function':
+            conn.create_function(name, payload[1], None)
+        elif kind == 'aggregate':
+            conn.create_aggregate(name, payload[1], None)
+        elif kind == 'collation':
+            conn.create_collation(name, None)
+        elif kind == 'window':
+            conn.create_window_function(name, payload[1], None)
+        elif kind == 'module':
+            conn.createmodule(name, None)
 
     def _load_extensions(self, conn):
         conn.enable_load_extension(True)
-        for extension in self._extensions:
+        for extension in tuple(self._extensions):
             conn.load_extension(extension)
 
     def load_extension(self, extension):

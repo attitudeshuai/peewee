@@ -237,9 +237,15 @@ class PooledDatabase(object):
     def dispose(self):
         super(PooledDatabase, self).dispose()
         with self._pool_lock:
+            conns = [conn for _, _, conn in self._connections]
+            conns.extend(pc.connection for pc in self._in_use.values())
             self._connections = []
             self._in_use = {}
             self._pool_available.notify_all()
+        registry = getattr(self, '_ext', None)
+        if registry is not None:
+            for conn in conns:
+                registry.untrack(conn)
 
 
 class _PooledMySQLDatabase(PooledDatabase):

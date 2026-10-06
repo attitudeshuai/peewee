@@ -66,14 +66,15 @@ class APSWDatabase(SqliteDatabase):
     def __init__(self, database, **kwargs):
         self._modules = {}
         super(APSWDatabase, self).__init__(database, **kwargs)
+        # APSW connections may be shared and modified across threads.
+        self._ext.cross_thread = True
 
-    def register_module(self, mod_name, mod_inst):
-        self._modules[mod_name] = mod_inst
-        if not self.is_closed():
-            self.connection().createmodule(mod_name, mod_inst)
+    def register_module(self, mod_name, mod_inst, override=False):
+        return self._ext.register('module', mod_name, mod_inst,
+                                  override=override)
 
-    def unregister_module(self, mod_name):
-        del(self._modules[mod_name])
+    def unregister_module(self, mod_name, policy=UNREGISTER_PENDING):
+        return self._ext.unregister('module', mod_name, policy)
 
     def _connect(self):
         conn = apsw.Connection(self.database, **self.connect_params)
@@ -87,35 +88,48 @@ class APSWDatabase(SqliteDatabase):
         return conn
 
     def _add_conn_hooks(self, conn):
-        super(APSWDatabase, self)._add_conn_hooks(conn)
-        self._load_modules(conn)  # APSW-only.
+        snapshot = super(APSWDatabase, self)._add_conn_hooks(conn)
+        self._load_modules(conn, snapshot.get('module', ()))
+        return snapshot
 
-    def _load_modules(self, conn):
-        for mod_name, mod_inst in self._modules.items():
+    def _load_modules(self, conn, items):
+        for mod_name, mod_inst in items.items():
             conn.createmodule(mod_name, mod_inst)
-        return conn
 
-    def _load_aggregates(self, conn):
-        for name, (klass, num_params) in self._aggregates.items():
+    def _load_aggregates(self, conn, items):
+        for name, (klass, num_params) in items.items():
             def make_aggregate(klass=klass):
                 return (klass(), klass.step, klass.finalize)
             conn.createaggregatefunction(name, make_aggregate)
 
-    def _load_collations(self, conn):
-        for name, fn in self._collations.items():
+    def _load_collations(self, conn, items):
+        for name, fn in items.items():
             conn.createcollation(name, fn)
 
-    def _load_functions(self, conn):
-        for name, (fn, num_params, deterministic) in self._functions.items():
+    def _load_functions(self, conn, items):
+        for name, (fn, num_params, deterministic) in items.items():
             args = (deterministic,) if deterministic else ()
             conn.createscalarfunction(name, fn, num_params, *args)
 
-    def _load_window_functions(self, conn):
-        for name, (klass, num_params) in self._window_functions.items():
+    def _load_window_functions(self, conn, items):
+        for name, (klass, num_params) in items.items():
             def make_window(klass=klass):
                 return (klass(), klass.step, klass.finalize, klass.value,
                         klass.inverse)
             conn.create_window_function(name, make_window, num_params)
+
+    def _unload_extension(self, kind, conn, name, payload):
+        if kind == 'function':
+            args = (payload[2],) if payload[2] else ()
+            conn.createscalarfunction(name, None, payload[1], *args)
+        elif kind == 'aggregate':
+            conn.createaggregatefunction(name, None)
+        elif kind == 'collation':
+            conn.createcollation(name, None)
+        elif kind == 'window':
+            conn.create_window_function(name, None, payload[1])
+        elif kind == 'module':
+            conn.createmodule(name, None)
 
     def _load_extensions(self, conn):
         conn.enableloadextension(True)

@@ -100,10 +100,11 @@ class CySqliteDatabase(SqliteDatabase):
             conn.trace(*self._trace)
         if self._progress is not None:
             conn.progress(*self._progress)
-        super(CySqliteDatabase, self)._add_conn_hooks(conn)
+        snapshot = super(CySqliteDatabase, self)._add_conn_hooks(conn)
         if self._table_functions:
-            for table_function in self._table_functions:
+            for table_function in list(self._table_functions):
                 table_function.register(conn)
+        return snapshot
 
     def _set_pragmas(self, conn):
         for pragma, value in self._pragmas:
@@ -113,20 +114,20 @@ class CySqliteDatabase(SqliteDatabase):
         for name, db in self._attached.items():
             conn.attach(db, name)
 
-    def _load_aggregates(self, conn):
-        for name, (klass, num_params) in self._aggregates.items():
+    def _load_aggregates(self, conn, items):
+        for name, (klass, num_params) in items.items():
             conn.create_aggregate(klass, name, num_params)
 
-    def _load_collations(self, conn):
-        for name, fn in self._collations.items():
+    def _load_collations(self, conn, items):
+        for name, fn in items.items():
             conn.create_collation(fn, name)
 
-    def _load_functions(self, conn):
-        for name, (fn, num_params, deterministic) in self._functions.items():
+    def _load_functions(self, conn, items):
+        for name, (fn, num_params, deterministic) in items.items():
             conn.create_function(fn, name, num_params, deterministic)
 
-    def _load_window_functions(self, conn):
-        for name, (klass, num_params) in self._window_functions.items():
+    def _load_window_functions(self, conn, items):
+        for name, (klass, num_params) in items.items():
             conn.create_window_function(klass, name, num_params)
 
     def register_table_function(self, klass, name=None, columns=None,
