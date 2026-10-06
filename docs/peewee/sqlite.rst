@@ -883,9 +883,73 @@ another thread appearing between them. The ``atomic()`` and
 To write directly, bypassing the queue (for example, a bulk import through
 a separate connection), use :meth:`~SqliteQueueDatabase.pause` and
 :meth:`~SqliteQueueDatabase.unpause`. While paused the writer thread is
-disconnected, and writes submitted through the queue raise ``WriterPaused``.
+disconnected. With the default (non-persistent) configuration writes
+submitted through the queue while paused raise ``WriterPaused``; when
+persistent spooling is enabled they are staged instead and executed in
+order after resume.
 
-.. class:: SqliteQueueDatabase(database, use_gevent=False, autostart=True, queue_max_size=None, results_timeout=None, **kwargs)
+Persistent spooling
+~~~~~~~~~~~~~~~~~~~
+
+By default the write queue lives only in memory: if the process is killed,
+writes waiting in the queue are lost. Pass ``persistent=True`` to stage
+each write in a local on-disk spool *before* it enters the queue. On the
+next startup the writer replays the spooled contents, in their original
+order, before accepting any new write requests.
+
+.. code-block:: python
+
+   db = SqliteQueueDatabase(
+       'my_app.db',
+       persistent=True,          # Enable disk spooling (default False).
+       spool_dir='spool/',       # Spool location (default: <database>.spool).
+       spool_max_size=1000)      # Max spooled writes (default: unbounded).
+
+Each write receives a unique request id. The id is committed to an internal
+table in the **same transaction** as the write, which makes replay
+idempotent: an entry that already committed is skipped even if the process
+died before the spool acknowledgement, and no request is executed twice.
+
+When the spool reaches ``spool_max_size`` the **oldest pending entries are
+discarded** to make room. Discards never raise or block the calling code;
+the cumulative number of dropped requests is available through
+:meth:`~SqliteQueueDatabase.spool_discarded` and is retained across
+restarts. If the spool directory cannot be created or written to, a single
+warning is logged and the database transparently falls back to the normal
+in-memory queue behavior.
+
+Writes submitted while the writer is :meth:`~SqliteQueueDatabase.pause`d
+are also spooled; their result objects remain not-ready until the writer
+resumes and drains them in order.
+
+On shutdown :meth:`~SqliteQueueDatabase.stop` first stops accepting new
+writes, then waits for queued writes to finish. An optional ``timeout``
+limits the wait; if it expires, the remaining entries stay in the spool and
+are replayed on the next startup.
+
+**Semantics, persistent disabled (default) vs enabled:**
+
+============================================================= ===============================================
+Disabled                                                       Enabled
+============================================================= ===============================================
+Writes go straight into the in-memory queue.                    Writes land in the on-disk spool first, then
+                                                               queue.
+A hard process kill loses every queued write.                  A hard kill loses nothing already spooled; the
+                                                               next start replays it in order before new writes.
+No request ids; a write can be re-executed after a crash.       Each write gets a unique id committed with the
+                                                               write itself; replays never execute it twice.
+Queue full: the sender blocks (or fails) on ``put()``.          Spool full: oldest pending writes are dropped
+                                                               silently and counted in ``spool_discarded()``.
+While paused, queued writes raise ``WriterPaused``.             While paused, writes are spooled and run in
+                                                               order after resume.
+``stop()`` signals the writer to exit immediately and fails     ``stop(timeout)`` stops intake, drains in-flight
+any still-queued write with ``ShutdownException``.             writes, and on timeout leaves entries for the
+                                                               next start.
+Spool directory not applicable.                                Unwritable spool directory: one warning, then
+                                                               in-memory fallback.
+============================================================= ===============================================
+
+.. class:: SqliteQueueDatabase(database, use_gevent=False, autostart=True, queue_max_size=None, results_timeout=None, persistent=False, spool_dir=None, spool_max_size=None, **kwargs)
 
    :param str database: database filename.
    :param bool use_gevent: use gevent instead of ``threading``.
@@ -893,31 +957,52 @@ disconnected, and writes submitted through the queue raise ``WriterPaused``.
    :param int queue_max_size: maximum size of pending writes queue.
    :param float results_timeout: timeout for waiting for query results from
        write thread (seconds).
+   :param bool persistent: stage writes on disk and replay them after a
+       restart. Disabled by default.
+   :param str spool_dir: directory for the spool files. Defaults to
+       ``<database>.spool`` (or a temporary directory for ``:memory:``).
+   :param int spool_max_size: maximum number of pending spooled writes.
+       When exceeded, the oldest pending write is dropped. ``None`` (the
+       default) means unbounded.
 
    .. method:: start()
 
-      Start the background writer thread.
+      Start the background writer thread. When persistence is enabled, any
+      writes left in the spool by a previous run are replayed, in order,
+      before new writes are accepted.
 
-   .. method:: stop()
+   .. method:: stop(timeout=None)
 
-      Signal the writer thread to stop. Blocks until all pending writes
-      are flushed.
+      Stop accepting new writes, then signal the writer thread to finish.
+      With persistence disabled the writer exits immediately and pending
+      writes receive ``ShutdownException``. With persistence enabled the
+      writer drains the queued writes; if ``timeout`` (seconds) expires
+      first, the remaining entries stay in the spool for the next startup
+      and ``False`` is returned. Returns ``True`` on a clean shutdown.
 
    .. method:: is_stopped()
 
       Return ``True`` if the writer thread is not running.
 
+   .. method:: spool_discarded()
+
+      Return the cumulative number of writes dropped because the spool was
+      full. The count is retained across restarts (returns ``0`` when
+      persistence is disabled).
+
    .. method:: pause()
 
       Block until the writer thread finishes its current work, then
       disconnect it so another connection may write to the database
-      directly. While paused, writes submitted through the queue raise
-      ``WriterPaused``. Must be followed by a call to
-      :meth:`~SqliteQueueDatabase.unpause`.
+      directly. When persistence is disabled, writes submitted through the
+      queue while paused raise ``WriterPaused``; when enabled, they are
+      spooled and executed in order after resume. Must be followed by a
+      call to :meth:`~SqliteQueueDatabase.unpause`.
 
    .. method:: unpause()
 
-      Resume the writer thread and reconnect the queue.
+      Resume the writer thread, reconnect the queue and drain the writes
+      staged during the pause.
 
 
 .. _sqlite-fields:

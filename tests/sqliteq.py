@@ -1,6 +1,9 @@
 import os
+import shutil
+import tempfile
 import threading
 import time
+import logging
 from functools import partial
 
 try:
@@ -11,6 +14,8 @@ except ImportError:
 
 from peewee import *
 from playhouse.sqliteq import ResultTimeout
+from playhouse.sqliteq import ShutdownException
+from playhouse.sqliteq import Spool
 from playhouse.sqliteq import SqliteQueueDatabase
 from playhouse.sqliteq import WriterPaused
 
@@ -258,3 +263,273 @@ class TestThreadedDatabaseGreenlets(BaseTestQueueDatabase, BaseTestCase):
 
     def create_event(self):
         return GreenEvent()
+
+
+class TestPersistentSpool(BaseTestCase):
+    """Tests for disk-backed spooling and restart replay."""
+
+    def setUp(self):
+        super(TestPersistentSpool, self).setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.db_file = os.path.join(self.tmp, 'spool_test.db')
+        self.spool_dir = os.path.join(self.tmp, 'spool')
+        self.instances = []
+
+    def tearDown(self):
+        for instance in self.instances:
+            try:
+                instance.stop()
+            except Exception:
+                pass
+            try:
+                instance.close()
+            except Exception:
+                pass
+            spool = getattr(instance, '_spool', None)
+            if spool is not None:
+                spool.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        super(TestPersistentSpool, self).tearDown()
+
+    def new_database(self, **config):
+        config.setdefault('persistent', True)
+        config.setdefault('autostart', False)
+        database = SqliteQueueDatabase(self.db_file,
+                                       spool_dir=self.spool_dir, **config)
+        self.instances.append(database)
+        return database
+
+    def create_table(self, database):
+        cursor = database.execute_sql(
+            'create table if not exists spool_user ('
+            'id integer primary key, name text)')
+        cursor.fetchone()
+
+    def get_names(self, database):
+        return [row[0] for row in database.execute_sql(
+            'select name from spool_user order by name').fetchall()]
+
+    def stage_backlog(self):
+        # Commit "a", stop cleanly, then leave "b" and "c" only in the spool
+        # (process "killed" before they could run).
+        database = self.new_database()
+        database.start()
+        self.create_table(database)
+        database.execute_sql(
+            "insert into spool_user (name) values ('a')").fetchone()
+        database.stop()
+        database.close()
+        database.execute_sql("insert into spool_user (name) values ('b')")
+        database.execute_sql("insert into spool_user (name) values ('c')")
+        return database
+
+    def test_disabled_by_default(self):
+        database = SqliteQueueDatabase(self.db_file, autostart=False)
+        self.instances.append(database)
+        self.assertTrue(database._spool is None)
+
+    def test_spool_replays_backlog_in_order(self):
+        first = self.stage_backlog()
+        self.assertEqual(first.spool_discarded(), 0)
+
+        # A fresh database instance replays the spool before new writes.
+        database = self.new_database()
+        database.start()
+        self.assertEqual(self.get_names(database), ['a', 'b', 'c'])
+
+        # Replayed entries are acknowledged and do not replay again.
+        self.assertEqual(database._spool.pending_entries(), [])
+        database.stop()
+        database.close()
+
+        restarted = self.new_database()
+        restarted.start()
+        self.assertEqual(self.get_names(restarted), ['a', 'b', 'c'])
+
+    def test_replay_deduplicates_by_request_id(self):
+        self.stage_backlog()
+
+        database = self.new_database()
+        database.start()
+        self.assertEqual(self.get_names(database), ['a', 'b', 'c'])
+        # Restarting any number of times never executes an entry twice.
+        for _ in range(3):
+            database.stop()
+            database.close()
+            database = self.new_database()
+            database.start()
+            self.assertEqual(self.get_names(database), ['a', 'b', 'c'])
+
+    def test_dropped_oldest_is_counted(self):
+        database = self.new_database(spool_max_size=3)
+        database.start()
+        self.create_table(database)
+        database.stop()
+        database.close()
+
+        # Seven submissions into a cap-3 spool never raise or block.
+        for i in range(7):
+            cursor = database.execute_sql(
+                "insert into spool_user (name) values ('n%d')" % i)
+            self.assertTrue(cursor is not None)
+        self.assertEqual(database.spool_discarded(), 4)
+
+        restarted = self.new_database(spool_max_size=3)
+        restarted.start()
+        # Only the three newest entries survive and are replayed.
+        self.assertEqual(self.get_names(restarted),
+                         ['n4', 'n5', 'n6'])
+        # Cumulative discard count survives the restart.
+        self.assertEqual(restarted.spool_discarded(), 4)
+
+    def test_unwritable_directory_warns_once(self):
+        blocker = os.path.join(self.tmp, 'not-a-directory')
+        with open(blocker, 'w') as fh:
+            fh.write('x')
+
+        records = []
+
+        class ListHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = ListHandler()
+        spool_logger = logging.getLogger('peewee.sqliteq')
+        spool_logger.addHandler(handler)
+        try:
+            database = SqliteQueueDatabase(
+                self.db_file, persistent=True, spool_dir=blocker,
+                autostart=False)
+            self.instances.append(database)
+
+            warnings = [r for r in records
+                        if 'not writable' in r.getMessage()]
+            self.assertEqual(len(warnings), 1)
+
+            # Fallback: plain in-memory queue behavior.
+            self.assertTrue(database._spool is None)
+            database.start()
+            self.create_table(database)
+            database.execute_sql(
+                "insert into spool_user (name) values ('x')").fetchone()
+            self.assertEqual(self.get_names(database), ['x'])
+
+            # No further warnings on subsequent operations.
+            self.assertEqual(
+                len([r for r in records
+                     if 'not writable' in r.getMessage()]), 1)
+        finally:
+            spool_logger.removeHandler(handler)
+
+    def test_pause_resume_stages_and_replays(self):
+        database = self.new_database()
+        database.start()
+        self.create_table(database)
+        database.pause()
+
+        # Writes while paused are staged and remain not-ready; they do not
+        # raise WriterPaused.
+        cursor_a = database.execute_sql(
+            "insert into spool_user (name) values ('p1')")
+        cursor_b = database.execute_sql(
+            "insert into spool_user (name) values ('p2')")
+        self.assertFalse(cursor_a._event.is_set())
+        self.assertFalse(cursor_b._event.is_set())
+
+        database.unpause()
+        cursor_a.fetchone()
+        cursor_b.fetchone()
+        self.assertEqual(self.get_names(database), ['p1', 'p2'])
+
+    def test_stop_rejects_new_writes_and_defers(self):
+        database = self.new_database()
+        entered = threading.Event()
+        release = threading.Event()
+
+        @database.func()
+        def gate(value):
+            entered.set()
+            release.wait(5)
+            return value
+
+        database.start()
+        self.create_table(database)
+        database.execute_sql(
+            "insert into spool_user (name) values ((select gate('g0')))")
+        self.assertTrue(entered.wait(2))
+
+        def shutdown():
+            return database.stop(timeout=2)
+
+        stop_thread = threading.Thread(target=shutdown)
+        stop_thread.start()
+
+        # While shutting down new writes are refused.
+        deadline = time.time() + 2
+        while not database._closing and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(database._closing)
+        self.assertRaises(
+            ShutdownException,
+            lambda: database.execute_sql(
+                "insert into spool_user (name) values ('late')"))
+
+        release.set()
+        stop_thread.join(5)
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(self.get_names(database), ['g0'])
+
+    def test_stop_timeout_leaves_entries_for_next_start(self):
+        database = self.new_database()
+
+        @database.func()
+        def slow(n):
+            time.sleep(n)
+            return n
+
+        database.start()
+        self.create_table(database)
+        for _ in range(5):
+            database.execute_sql(
+                "insert into spool_user (name) values ((select slow(0.1)))")
+
+        self.assertFalse(database.stop(timeout=0.05))
+
+        # The daemon writer finishes draining; wait, then simulate a new
+        # process over the same spool.
+        writer = database._writer
+        deadline = time.time() + 10
+        while database._thread_helper.is_alive(writer) and \
+                time.time() < deadline:
+            time.sleep(0.02)
+        database.close()
+        database._spool.close()
+
+        restarted = self.new_database()
+        restarted.start()
+        count = restarted.execute_sql(
+            'select count(*) from spool_user').fetchone()[0]
+        self.assertEqual(count, 5)
+
+    def test_torn_spool_tail_is_repaired(self):
+        database = self.new_database()
+        database.start()
+        self.create_table(database)
+        database.execute_sql(
+            "insert into spool_user (name) values ('a')").fetchone()
+        database.stop()
+        database.close()
+        database._spool.close()
+
+        # Corrupt the tail of the spool log (partial final frame).
+        log_path = os.path.join(self.spool_dir, Spool.LOG_NAME)
+        with open(log_path, 'ab') as fh:
+            fh.write(b'\xff\x00\x10garbage-not-a-frame')
+
+        restarted = self.new_database()
+        restarted.start()
+        self.assertEqual(self.get_names(restarted), ['a'])
+        # The repaired spool accepts new writes normally.
+        restarted.execute_sql(
+            "insert into spool_user (name) values ('b')").fetchone()
+        self.assertEqual(self.get_names(restarted), ['a', 'b'])
