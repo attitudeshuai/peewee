@@ -8,6 +8,10 @@ from io import StringIO
 
 from peewee import *
 from playhouse.dataset import DataSet
+from playhouse.dataset import ImportRowError
+from playhouse.dataset import TransferConflict
+from playhouse.dataset import TransferDegraded
+from playhouse.dataset import TransferSizeLimit
 
 from .base import ModelTestCase
 from .base import TestModel
@@ -730,6 +734,210 @@ class TestDataSet(ModelTestCase):
             {'id': 1, 'name': 'charlie', 'color': None},
             {'id': 2, 'name': 'huey', 'color': 'white'},
         ])
+
+    def remove_transfer_files(self, path):
+        for suffix in ('', '.freeze.state', '.freeze.state.lock',
+                       '.thaw.state', '.thaw.state.lock'):
+            candidate = path + suffix
+            if os.path.exists(candidate):
+                os.unlink(candidate)
+
+    def test_chunked_export_resume(self):
+        user = self.dataset['user']
+        for username in self.names:
+            user.insert(username=username)
+
+        path = tempfile.mktemp(suffix='.json')
+        state_path = path + '.freeze.state'
+        try:
+            result = self.dataset.freeze(
+                user.all(), 'json', filename=path, chunksize=2)
+            self.assertEqual(result.total_rows, 5)
+            self.assertEqual(result.chunks_completed, 3)
+            self.assertEqual(result.rows_exported, 5)
+            self.assertEqual(result.columns, ['username'])
+            with open(path) as fh:
+                self.assertEqual(len(json.load(fh)), 5)
+            with open(state_path) as fh:
+                state = json.load(fh)
+            self.assertTrue(state['complete'])
+            self.assertEqual(state['columns'], ['username'])
+            self.assertEqual(
+                [(c['start_row'], c['end_row']) for c in state['chunks']],
+                [(0, 2), (2, 4), (4, 5)])
+            self.assertTrue(all(c['checksum'] for c in state['chunks']))
+            self.assertTrue(state['file_sha256'])
+
+            # Simulate interruption immediately after the first chunk.
+            state['complete'] = False
+            state['total_rows'] = 0
+            state['chunks'] = state['chunks'][:1]
+            state['file_position'] = state['chunks'][0]['file_position']
+            state['file_sha256'] = state['chunks'][0]['file_sha256']
+            with open(state_path, 'w') as fh:
+                json.dump(state, fh)
+
+            resumed = self.dataset.freeze(
+                user.all(), 'json', filename=path, chunksize=2)
+            self.assertTrue(resumed.resumed)
+            self.assertEqual(resumed.resumed_chunks, 1)
+            self.assertEqual(resumed.rows_exported, 3)
+            self.assertEqual(resumed.total_rows, 5)
+            with open(path) as fh:
+                rows = json.load(fh)
+            self.assertEqual(
+                sorted(row['username'] for row in rows),
+                sorted(self.names))
+
+            complete = self.dataset.freeze(
+                user.all(), 'json', filename=path, chunksize=2)
+            self.assertTrue(complete.complete)
+            self.assertEqual(complete.rows_exported, 0)
+        finally:
+            self.remove_transfer_files(path)
+
+    def test_chunked_import_idempotent_and_aligned(self):
+        self.database.execute_sql(
+            'create table chunk_people ('
+            'id integer primary key, name text not null, num integer)')
+        self.dataset.update_cache('chunk_people')
+        path = tempfile.mktemp(suffix='.csv')
+        state_path = path + '.thaw.state'
+        with open(path, 'w', newline='') as fh:
+            writer = csv.writer(fh)
+            writer.writerow(['id', 'name', 'num'])
+            writer.writerows([
+                (1, 'a', '10'),
+                (2, 'b', '20'),
+                (3, 'c', '30'),
+                (4, 'd', '40'),
+            ])
+        try:
+            result = self.dataset.thaw(
+                'chunk_people', 'csv', filename=path, chunksize=2)
+            self.assertEqual(result, 4)
+            self.assertTrue(result.transactional)
+            self.assertTrue(result.batched)
+            self.assertEqual(result.columns, ['id', 'name', 'num'])
+            rows = list(self.dataset['chunk_people'].all().order_by(
+                self.dataset['chunk_people'].model_class.id))
+            self.assertEqual(rows, [
+                {'id': 1, 'name': 'a', 'num': 10},
+                {'id': 2, 'name': 'b', 'num': 20},
+                {'id': 3, 'name': 'c', 'num': 30},
+                {'id': 4, 'name': 'd', 'num': 40}])
+
+            with open(state_path) as fh:
+                state = json.load(fh)
+            self.assertTrue(state['complete'])
+            self.assertEqual(
+                [(c['start_row'], c['end_row'], c['line_start'],
+                  c['line_end']) for c in state['chunks']],
+                [(0, 2, 2, 3), (2, 4, 4, 5)])
+
+            repeated = self.dataset.thaw(
+                'chunk_people', 'csv', filename=path, chunksize=2)
+            self.assertEqual(repeated, 0)
+            self.assertEqual(repeated.skipped_chunks, 2)
+            self.assertEqual(len(self.dataset['chunk_people']), 4)
+        finally:
+            self.remove_transfer_files(path)
+
+    def test_chunked_import_column_policies_and_row_error(self):
+        table = self.dataset['policy_people']
+        data = json.dumps([
+            {'name': 'a', 'score': 1},
+            {'name': 'b'},
+            {'name': 'c', 'score': 3},
+            {'score': 4},
+        ])
+        result = self.dataset.thaw(
+            'policy_people', 'json', file_obj=StringIO(data),
+            chunksize=2, state_file=StringIO())
+        self.assertEqual(result, 4)
+        self.assertEqual(
+            set(table.columns), set(['id', 'name', 'score']))
+        self.assertEqual(
+            sorted(table.all(), key=lambda row: row['id']),
+            [{'id': 1, 'name': 'a', 'score': 1},
+             {'id': 2, 'name': 'b', 'score': None},
+             {'id': 3, 'name': 'c', 'score': 3},
+             {'id': 4, 'name': None, 'score': 4}])
+
+        self.database.execute_sql(
+            'create table strict_people ('
+            'id integer primary key, name text not null)')
+        self.dataset.update_cache('strict_people')
+        with self.assertRaises(TransferConflict):
+            self.dataset.thaw(
+                'strict_people', 'json',
+                file_obj=StringIO('[{"name":"a","extra":1}]'),
+                chunksize=1, state_file=StringIO(),
+                on_unknown='error')
+        with self.assertRaises(TransferConflict):
+            self.dataset.thaw(
+                'strict_people', 'csv', file_obj=StringIO('id\n1\n'),
+                chunksize=1, state_file=StringIO(),
+                on_missing='error')
+        self.assertEqual(len(self.dataset['strict_people']), 0)
+
+        self.database.execute_sql(
+            'create table typed_people ('
+            'id integer primary key, num integer not null)')
+        self.dataset.update_cache('typed_people')
+        with self.assertRaises(ImportRowError) as ctx:
+            self.dataset.thaw(
+                'typed_people', 'csv',
+                file_obj=StringIO('id,num\n1,1\n2,bad\n'),
+                chunksize=10, state_file=StringIO())
+        self.assertEqual(ctx.exception.line_number, 3)
+        self.assertEqual(ctx.exception.row_number, 2)
+        self.assertEqual(ctx.exception.column, 'num')
+        self.assertEqual(ctx.exception.value, 'bad')
+        self.assertEqual(len(self.dataset['typed_people']), 0)
+
+    def test_chunked_size_limits_are_reported(self):
+        user = self.dataset['user']
+        user.insert(username='a')
+        user.insert(username='b')
+        with self.assertRaises(TransferSizeLimit):
+            user.freeze(file_obj=StringIO(), format='json',
+                        chunksize=1, state_file=StringIO(), max_rows=1)
+        with self.assertRaises(TransferSizeLimit):
+            user.thaw(file_obj=StringIO('username\na\nb\n'), format='csv',
+                      chunksize=1, state_file=StringIO(), max_rows=1)
+
+    def test_chunked_import_without_transactions_is_degraded(self):
+        self.database.execute_sql(
+            'create table degraded_people ('
+            'id integer primary key, num integer not null)')
+        self.dataset.update_cache('degraded_people')
+        with self.assertRaises(TransferDegraded) as ctx:
+            self.dataset.thaw(
+                'degraded_people', 'csv',
+                file_obj=StringIO('id,num\n1,1\n1,2\n'),
+                chunksize=10, state_file=StringIO(),
+                use_transaction=False)
+        self.assertEqual(ctx.exception.committed_lines, [2])
+        self.assertEqual(
+            [row['id'] for row in self.dataset['degraded_people'].all()],
+            [1])
+
+    def test_chunked_transfer_lock_conflict(self):
+        lock = self.dataset._transfer_lock(
+            'locked_table', 'import', 'owner-1', True)
+        lock.__enter__()
+        try:
+            second = DataSet(
+                'sqlite:///%s' % self.database.database)
+            try:
+                with self.assertRaises(TransferConflict):
+                    second._transfer_lock(
+                        'locked_table', 'export', 'owner-2', True)
+            finally:
+                second.close()
+        finally:
+            lock.__exit__(None, None, None)
 
     def test_creating_tables(self):
         new_table = self.dataset['new_table']
