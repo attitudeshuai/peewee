@@ -964,6 +964,8 @@ lines:
    models = app.models
    # directory = migrations/
    # table = schema_migration
+   # lock = true
+   # wait = 30
 
 This allows us to run migration commands without explicitly specifying the
 paths each time:
@@ -982,6 +984,9 @@ Recognized keys:
 * ``models`` - models module, read by ``diff``, ``initial`` and ``generate``
 * ``schema`` - schema containing the tables to be migrated
 * ``table`` - history table name
+* ``lock`` - ``true``/``false``, defaults to off (see
+  :ref:`pwmigrate-locking`)
+* ``wait`` - seconds to wait for a locked migration (default 10)
 
 The file is read from the working directory only. A different config
 file is named with ``-c``. Unrecognized keys warn on stderr. Arguments
@@ -994,6 +999,9 @@ Commands
 | Command      | Meaning                                                    |
 +==============+============================================================+
 | ``status``   | List migrations and applied timestamps.                    |
++--------------+------------------------------------------------------------+
+| ``plan``     | Print what ``up``/``down`` would do (apply, skip, in       |
+|              | progress, missing file) without touching the database.     |
 +--------------+------------------------------------------------------------+
 | ``up``       | Apply pending migrations in order, stopping after          |
 |              | ``target`` when given.                                     |
@@ -1016,17 +1024,26 @@ Commands
 
 Command-line options:
 
-+--------+---------------------------------------------------+--------------------+
-| Option | Meaning                                           | Example            |
-+========+===================================================+====================+
-| ``-d`` | Migrations directory (default ``migrations``)     | ``-d db/schema``   |
-+--------+---------------------------------------------------+--------------------+
-| ``-t`` | History table name (default ``schema_migration``) |                    |
-+--------+---------------------------------------------------+--------------------+
-| ``-v`` | Echo SQL as it executes                           |                    |
-+--------+---------------------------------------------------+--------------------+
-| ``-c`` | Config file supplying defaults                    | ``-c pw.conf``     |
-+--------+---------------------------------------------------+--------------------+
++-----------+---------------------------------------------------+--------------------+
+| Option    | Meaning                                           | Example            |
++===========+===================================================+====================+
+| ``-d``    | Migrations directory (default ``migrations``)     | ``-d db/schema``   |
++-----------+---------------------------------------------------+--------------------+
+| ``-t``    | History table name (default ``schema_migration``) |                    |
++-----------+---------------------------------------------------+--------------------+
+| ``-v``    | Echo SQL as it executes                           |                    |
++-----------+---------------------------------------------------+--------------------+
+| ``-c``    | Config file supplying defaults                    | ``-c pw.conf``     |
++-----------+---------------------------------------------------+--------------------+
+| ``--lock`` | Serialize each migration across processes (see   |                    |
+|           | :ref:`locking <pwmigrate-locking>`).              |                    |
++-----------+---------------------------------------------------+--------------------+
+| ``--wait``| Seconds to wait for a locked migration before     | ``--wait 30``      |
+|           | failing (default 10; ``0`` fails immediately).    |                    |
++-----------+---------------------------------------------------+--------------------+
+| ``-f``    | (``up``/``down``) Re-run a migration an interrupted| ``up --force``   |
+| ``--force``| process left in an in-progress state.            |                    |
++-----------+---------------------------------------------------+--------------------+
 
 ``status`` exits 0 when the database is current and 1 when migrations
 are pending, so it can gate a deploy. Validation and database errors
@@ -1050,6 +1067,40 @@ Behavior:
 * A migration that does not define ``down()`` cannot be reverted (there
   is no requirement to write one).
 
+.. _pwmigrate-locking:
+
+Cross-process locking and recovery
+""""""""""""""""""""""""""""""""""
+
+By default the runner trusts that one process applies migrations. When
+several instances may start at once (e.g. auto-scaled deployments), pass
+``--lock`` on the command line, ``lock = true`` in the config file, or
+``Runner(..., lock=True)`` from Python:
+
+* Each migration is claimed by exactly one process for its whole
+  duration. Postgres uses session-level advisory locks (``pg_advisory_lock``),
+  MySQL uses named locks (``GET_LOCK``); other backends serialize on the
+  committed claim row. A second runner that cannot acquire a migration
+  waits up to ``--wait`` seconds, then exits with a clear "locked" error
+  instead of executing anything.
+* Before a migration body runs, its history row is marked
+  ``running`` (``reverting`` for a rollback) with a timestamp and a
+  ``pid@host`` holder tag. On success the marker and the history verdict
+  are settled in the migration's own transaction. ``up`` and ``down``
+  share the same lock, so they cannot interleave.
+* A process killed mid-migration leaves the marker behind. The next run
+  recognizes the entry, prints it as ``in progress`` in ``status`` and
+  ``plan``, and refuses to re-run it: its structural changes may already
+  be half applied. Inspect the schema and re-run with
+  ``up --force`` (or ``down --force``) to execute it again.
+* ``plan`` (``plan --down`` for a rollback plan) computes the full plan
+  read-only: what will run, what is already applied and skipped, what is
+  in progress, and applied migrations whose files are missing (a rollback
+  fails on those explicitly instead of skipping them).
+* Locking is opt-in; without ``--lock`` behavior and the history-table
+  schema are unchanged. Enabling it on an existing history table adds the
+  marker columns in place.
+
 Python interface
 ^^^^^^^^^^^^^^^^
 
@@ -1061,12 +1112,18 @@ All migration-runner operations are available programmatically:
 
    runner = Runner(db, directory='migrations')
    runner.create('add karma')  # Write a skeleton file.
-   runner.status()             # [Migration(idx, name, path, applied), ...]
+   runner.status()             # [Migration(idx, name, path, applied, state), ...]
+   runner.plan()               # Read-only [PlanItem(migration, action), ...].
    runner.up()                 # Apply everything pending, in order.
    runner.up('0004_x')         # Apply pending up through 0004_x.
+   runner.up(force=True)       # Re-run a migration left in progress.
    runner.down()               # Revert the most recent applied migration.
    runner.down('0004_x')       # Revert back through 0004_x, inclusive.
    runner.fake()               # Record all as applied without running.
+
+   # Cross-process-safe runner (advisory lock + in-progress marker).
+   runner = Runner(db, lock=True, wait_timeout=30)
+   runner.up()
 
 ``run(db)`` is shorthand for ``Runner(db, 'migrations').up()``.
 
@@ -1082,7 +1139,7 @@ Generate a migration from a diff:
    if diff:
        runner.create('add karma', body=template(diff))
 
-.. class:: Runner(database, directory='migrations', table_name='schema_migration', schema=None)
+.. class:: Runner(database, directory='migrations', table_name='schema_migration', schema=None, lock=False, wait_timeout=10.0)
 
    :param str schema: schema containing the tables to be migrated, passed to
        the :class:`~playhouse.migrate.SchemaMigrator`. The history table
@@ -1094,23 +1151,41 @@ Generate a migration from a diff:
        the runner will find no history there and consider every migration
        pending. Backfill with ``fake`` first.
 
-   .. method:: up(target=None)
+   :param bool lock: serialize each migration across processes and record
+       in-progress markers; see :ref:`pwmigrate-locking`. Off by default.
+
+   :param float wait_timeout: seconds a locked migration is waited for
+       before the runner reports it occupied instead of running it.
+
+   .. method:: up(target=None, fake=False, force=False)
 
       Apply all pending migrations in order, stopping after ``target`` if
-      given. Returns the applied names.
+      given. Returns the applied names. With ``force=True``, a migration
+      left in a running/reverting state by an interrupted process is
+      re-executed instead of refused.
 
-   .. method:: down(target=None)
+   .. method:: down(target=None, force=False)
 
       Revert the most recent applied migration, or, given a target, every
       applied migration back through the target (newest first). Returns
-      the reverted names.
+      the reverted names. ``force=True`` retries a migration interrupted
+      mid-revert; a missing migration file always aborts the plan.
+
+   .. method:: plan(target=None, revert=False)
+
+      Read-only. Return ``PlanItem(migration, action)`` namedtuples
+      merging files with history, without reading modules or writing
+      anything. Actions: ``apply``/``skip`` for upgrades, ``revert`` for
+      rollbacks, ``running`` for in-progress entries, and ``missing`` for
+      applied migrations whose files are gone.
 
    .. method:: status()
 
-      Return ``Migration`` namedtuples ``(idx, name, path, applied)``
+      Return ``Migration`` namedtuples ``(idx, name, path, applied, state)``
       merging migration files with history rows, in numeric order.
-      ``applied`` is None when pending, ``path`` is None when the file
-      is missing.
+      ``applied`` is None when pending or in progress, ``path`` is None
+      when the file is missing, and ``state`` is ``pending``, ``applied``,
+      ``running`` or ``reverting``.
 
    .. method:: fake(target=None)
 

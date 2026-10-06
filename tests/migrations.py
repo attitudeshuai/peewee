@@ -4,6 +4,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from functools import partial
@@ -11,6 +13,9 @@ from functools import partial
 from peewee import *
 from peewee import _truncate_constraint_name
 from playhouse.migrate import *
+from playhouse.migrations import APPLIED
+from playhouse.migrations import MigrationLocked
+from playhouse.migrations import RUNNING
 from playhouse.migrations import MigrationError
 from playhouse.migrations import Runner
 from playhouse.migrations import main as migrations_cli
@@ -1757,6 +1762,302 @@ class TestMigrationRunner(ModelTestCase):
         self.assertNotIn('notes', self.columns())
 
 
+class TestLockedMigrationRunner(ModelTestCase):
+    requires = [Person]
+
+    def setUp(self):
+        super(TestLockedMigrationRunner, self).setUp()
+        self.dir = tempfile.mkdtemp()
+        self.runner = self.make_runner(0.3)
+
+    def tearDown(self):
+        try:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            self.database.drop_tables([self.runner.History], safe=True)
+            self.database.execute_sql('DROP TABLE IF EXISTS runner_widget')
+        finally:
+            super(TestLockedMigrationRunner, self).tearDown()
+            self.database.close()
+
+    def make_runner(self, wait_timeout=2.0):
+        return Runner(self.database, self.dir, lock=True,
+                      wait_timeout=wait_timeout)
+
+    def write(self, filename, body):
+        with open(os.path.join(self.dir, filename), 'w') as fh:
+            fh.write(body)
+
+    def write_chain(self):
+        self.write('0001_notes.py', add_column_mig('notes'))
+        self.write('0002_email.py', add_column_mig('email'))
+        self.write('0003_phone.py', add_column_mig('phone'))
+
+    def columns(self):
+        return set(c.name for c in self.database.get_columns('person'))
+
+    def applied(self):
+        return [m.name for m in self.runner.status() if m.applied]
+
+    def seed_running(self, name='0001_notes', holder='4242@elsehost/deadbeef'):
+        self.runner._ensure_history()
+        self.runner.History.create(
+            name=name, applied=None, state=RUNNING,
+            started_at=datetime.datetime.now(), holder=holder)
+
+    def test_plan_preview_is_readonly(self):
+        self.write_chain()
+        items = self.runner.plan()
+        self.assertEqual(
+            [(i.migration.name, i.action) for i in items],
+            [('0001_notes', 'apply'),
+             ('0002_email', 'apply'),
+             ('0003_phone', 'apply')])
+        # Planning creates nothing.
+        self.assertFalse(self.runner.History.table_exists())
+
+        self.assertEqual(self.runner.up('0001_notes'), ['0001_notes'])
+        items = self.runner.plan()
+        self.assertEqual(
+            [(i.migration.name, i.action) for i in items],
+            [('0001_notes', 'skip'),
+             ('0002_email', 'apply'),
+             ('0003_phone', 'apply')])
+
+        items = self.runner.plan('0002_email')
+        self.assertEqual([i.migration.name for i in items],
+                         ['0001_notes', '0002_email'])
+
+        items = self.runner.plan(revert=True)
+        self.assertEqual([(i.migration.name, i.action) for i in items],
+                         [('0001_notes', 'revert')])
+
+    def test_marker_committed_before_body(self):
+        # The migration observes its own running marker from inside the
+        # body, i.e. it was committed before the migration ran.
+        body = (
+            "from peewee import *\n"
+            "def up(migrator, db):\n"
+            "    curs = db.execute_sql("
+            "'SELECT state FROM schema_migration WHERE name = ' + db.param,\n"
+            "                         ('0001_notes',))\n"
+            "    assert curs.fetchone() == ('running',)\n"
+            "    migrator.migrate(migrator.add_column("
+            "'person', 'notes', TextField(null=True)))\n"
+            "def down(migrator, db):\n"
+            "    migrator.migrate(migrator.drop_column('person', 'notes'))\n")
+        self.write('0001_notes.py', body)
+        self.assertEqual(self.runner.up(), ['0001_notes'])
+        row = self.runner.History.get(self.runner.History.name == '0001_notes')
+        self.assertEqual(row.state, 'applied')
+        self.assertIsNotNone(row.applied)
+        self.assertTrue(row.holder)
+        self.assertIn('notes', self.columns())
+
+        # The marker is removed again on revert.
+        self.assertEqual(self.runner.down(), ['0001_notes'])
+        self.assertFalse(self.runner.History.select().count())
+
+    def test_failure_leaves_running_marker(self):
+        self.write('0001_bad.py', RUNNER_MIG_BAD)
+        self.assertRaises(DatabaseError, self.runner.up)
+        row = self.runner.History.get(self.runner.History.name == '0001_bad')
+        self.assertEqual(row.state, 'running')
+        self.assertIsNone(row.applied)
+        self.assertTrue(row.holder)
+        self.assertEqual(self.applied(), [])
+        if self.runner.migrator.transactional_ddl:
+            self.assertNotIn('notes', self.columns())
+
+        # A restart recognises the interrupted migration and refuses.
+        with self.assertRaises(MigrationError) as ctx:
+            self.runner.up()
+        self.assertIn('0001_bad', str(ctx.exception))
+        self.assertIn('force=True', str(ctx.exception))
+
+        # Explicit force re-runs after the operator fixes the file.
+        if self.runner.migrator.transactional_ddl:
+            self.write('0001_bad.py', add_column_mig('notes'))
+        else:
+            # Non-transactional DDL already added the column.
+            self.write('0001_bad.py', "def up(migrator, db):\n    pass\n")
+        self.assertEqual(self.runner.up(force=True), ['0001_bad'])
+        self.assertEqual(self.applied(), ['0001_bad'])
+        self.assertIn('notes', self.columns())
+
+    def test_locked_busy_times_out(self):
+        self.write('0001_notes.py', add_column_mig('notes'))
+        self.seed_running()
+        runner = self.make_runner(0.1)
+        start = time.monotonic()
+        with self.assertRaises(MigrationLocked) as ctx:
+            runner.up()
+        self.assertGreaterEqual(time.monotonic() - start, 0.09)
+        message = str(ctx.exception)
+        self.assertIn('0001_notes', message)
+        self.assertIn('4242@elsehost/deadbeef', message)
+        # The waiter never executed the migration.
+        self.assertNotIn('notes', self.columns())
+
+    def test_waiter_skips_when_holder_finishes(self):
+        # Simulate another process completing the migration between two
+        # polling passes: the waiter observes 'applied' and skips it.
+        self.write('0001_notes.py', add_column_mig('notes'))
+        self.seed_running()
+
+        class FinishingRunner(Runner):
+            reads = 0
+            def _get_row(self, name):
+                self.reads += 1
+                if self.reads == 2:
+                    (self.History
+                     .update({self.History.state: APPLIED,
+                              self.History.applied: datetime.datetime.now()})
+                     .where(self.History.name == name)
+                     .execute())
+                return super(FinishingRunner, self)._get_row(name)
+
+        runner = FinishingRunner(self.database, self.dir, lock=True,
+                                 wait_timeout=5.0)
+        self.assertEqual(runner.up(), [])
+        self.assertNotIn('notes', self.columns())
+        self.assertEqual(self.applied(), ['0001_notes'])
+
+    @requires_sqlite
+    def test_two_connections_to_file_db(self):
+        db_path = os.path.join(self.dir, 'app.db')
+        db1 = SqliteDatabase(db_path, timeout=2)
+        db2 = SqliteDatabase(db_path, timeout=2)
+        db1.execute_sql('CREATE TABLE runner_widget (id INTEGER NOT NULL '
+                        'PRIMARY KEY, name TEXT)')
+
+        started = os.path.join(self.dir, 'started')
+        gate = os.path.join(self.dir, 'gate')
+        body = (
+            "import os, time\n"
+            "def up(migrator, db):\n"
+            "    open(%r, 'w').close()\n"
+            "    for _ in range(200):\n"
+            "        if os.path.exists(%r):\n"
+            "            break\n"
+            "        time.sleep(0.05)\n"
+            "    else:\n"
+            "        raise RuntimeError('gate never opened')\n"
+            "    db.execute_sql('ALTER TABLE runner_widget "
+            "ADD COLUMN notes TEXT')\n"
+            "def down(migrator, db):\n"
+            "    migrator.migrate(migrator.drop_column("
+            "'runner_widget', 'notes'))\n"
+            % (started, gate))
+        self.write('0001_widget.py', body)
+
+        runner1 = Runner(db1, self.dir, lock=True, wait_timeout=1.0)
+        runner2 = Runner(db2, self.dir, lock=True, wait_timeout=0.2)
+        errors = []
+        thread = threading.Thread(
+            target=lambda: errors.extend(
+                str(exc) for exc in [self._capture(runner1.up)]
+                if exc is not None))
+        thread.start()
+        try:
+            for _ in range(100):
+                if os.path.exists(started):
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(started))
+            # A second process is refused within its wait budget.
+            self.assertRaises(MigrationLocked, runner2.up)
+
+            open(gate, 'w').close()
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+
+            # The second connection sees the committed result and skips.
+            self.assertEqual(runner2.up(), [])
+            columns = [c.name for c in db2.get_columns('runner_widget')]
+            self.assertIn('notes', columns)
+        finally:
+            thread.join(10)
+            db1.close()
+            db2.close()
+
+    @staticmethod
+    def _capture(fn):
+        try:
+            fn()
+        except Exception as exc:
+            return exc
+
+    def test_locked_down_and_revert_recovery(self):
+        self.write_chain()
+        self.runner.up()
+        self.assertEqual(self.runner.down(), ['0003_phone'])
+        self.assertNotIn('phone', self.columns())
+
+        # Simulate a kill mid-revert of 0002.
+        (self.runner.History
+         .update({self.runner.History.state: 'reverting',
+                  self.runner.History.started_at: datetime.datetime.now(),
+                  self.runner.History.holder: '1@broken/1'})
+         .where(self.runner.History.name == '0002_email')
+         .execute())
+        with self.assertRaises(MigrationError) as ctx:
+            self.runner.down()
+        self.assertIn('reverting', str(ctx.exception))
+        self.assertIn('force=True', str(ctx.exception))
+        self.assertIn('email', self.columns())
+
+        self.assertEqual(self.runner.down(force=True), ['0002_email'])
+        self.assertNotIn('email', self.columns())
+        self.assertEqual(self.applied(), ['0001_notes'])
+
+    def test_locked_down_missing_file(self):
+        self.write_chain()
+        self.runner.up()
+        os.remove(os.path.join(self.dir, '0003_phone.py'))
+        self.assertRaises(MigrationError, self.runner.down)
+        # Nothing was reverted.
+        self.assertIn('phone', self.columns())
+
+    def test_locked_fake(self):
+        self.write_chain()
+        self.assertEqual(
+            self.runner.fake(),
+            ['0001_notes', '0002_email', '0003_phone'])
+        row = self.runner.History.get(
+            self.runner.History.name == '0001_notes')
+        self.assertEqual(row.state, 'applied')
+        self.assertIsNotNone(row.applied)
+        self.assertEqual(self.runner.up(), [])
+
+        # An in-progress migration cannot be faked away.
+        self.write('0004_extra.py', add_column_mig('extra'))
+        self.seed_running('0004_extra')
+        self.assertRaises(MigrationError, self.runner.fake, '0004_extra')
+
+    def test_history_upgrade_from_legacy_table(self):
+        # A table written by a release without in-progress columns.
+        self.database.execute_sql(
+            'CREATE TABLE schema_migration (id INTEGER NOT NULL PRIMARY '
+            'KEY, name VARCHAR(255) NOT NULL UNIQUE, '
+            'applied TIMESTAMP NOT NULL)')
+        self.database.execute_sql(
+            "INSERT INTO schema_migration (name, applied) "
+            "VALUES ('0001_notes', '2020-01-01 00:00:00')")
+        self.write('0001_notes.py', add_column_mig('notes'))
+        self.write('0002_email.py', add_column_mig('email'))
+
+        self.assertEqual(self.runner.up(), ['0002_email'])
+        columns = {c.name for c in
+                   self.database.get_columns('schema_migration')}
+        self.assertEqual(
+            columns,
+            {'id', 'name', 'applied', 'state', 'started_at', 'holder'})
+        # The legacy row was honoured: 0001 was not re-executed.
+        self.assertNotIn('notes', self.columns())
+        self.assertIn('email', self.columns())
+
+
 def run_cli(*args):
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
@@ -1828,6 +2129,29 @@ class TestRunnerSchema(DatabaseTestCase):
         self.assertEqual(self.runner.fake(), ['0001_notes'])
         self.assertEqual(self.columns(self.target), ['first_name', 'id'])
         self.assertEqual(self.runner.up(), [])
+
+    def test_advisory_lock_contention(self):
+        from .base import new_connection
+        # Advisory locks are real session locks on postgres.
+        runner = Runner(self.database, self.dir, schema=self.target,
+                        lock=True, wait_timeout=0.2)
+        self.assertEqual(runner._lock_kind, 'postgres')
+        other = new_connection()
+        key = runner._lock_key('0001_notes')
+        try:
+            other.execute_sql('SELECT pg_advisory_lock(%s)', (key,))
+            self.assertRaises(MigrationLocked, runner.up)
+            # Nothing was applied while the lock was held elsewhere.
+            self.assertEqual(self.columns(self.target),
+                             ['first_name', 'id'])
+        finally:
+            other.execute_sql(
+                'SELECT pg_advisory_unlock(%s)', (key,)).fetchall()
+            other.close()
+
+        self.assertEqual(runner.up(), ['0001_notes'])
+        self.assertEqual(self.columns(self.target),
+                         ['first_name', 'id', 'notes'])
 
 
 class TestMigrationRunnerCLI(BaseTestCase):
@@ -1916,6 +2240,77 @@ class TestMigrationRunnerCLI(BaseTestCase):
         self.assertIn('faked: 0001_add_widget', out)
         rc, out, err = run_cli(self.url, 'up', '-d', self.migdir)
         self.assertIn('nothing to do.', out)
+
+    def _write_widget_migration(self):
+        os.makedirs(self.migdir, exist_ok=True)
+        path = os.path.join(self.migdir, '0001_widget.py')
+        with open(path, 'w') as fh:
+            fh.write(
+                "def up(migrator, db):\n"
+                "    db.execute_sql('CREATE TABLE widget ('\n"
+                "                   'id INTEGER NOT NULL PRIMARY KEY, "
+                "name TEXT)')\n"
+                "def down(migrator, db):\n"
+                "    db.execute_sql('DROP TABLE widget')\n")
+        return path
+
+    def test_cli_plan(self):
+        self._write_widget_migration()
+        rc, out, err = run_cli(self.url, 'plan', '-d', self.migdir)
+        self.assertEqual(rc, 0)
+        self.assertIn('will apply: 0001_widget', out)
+
+        rc, out, err = run_cli(self.url, 'up', '--lock',
+                               '-d', self.migdir)
+        self.assertEqual(rc, 0)
+        self.assertIn('applied: 0001_widget', out)
+
+        rc, out, err = run_cli(self.url, 'plan', '-d', self.migdir)
+        self.assertEqual(rc, 0)
+        self.assertIn('will skip: 0001_widget', out)
+
+        rc, out, err = run_cli(self.url, 'plan', '--down',
+                               '-d', self.migdir)
+        self.assertEqual(rc, 0)
+        self.assertIn('will revert: 0001_widget', out)
+
+    def test_cli_locked_in_progress(self):
+        self._write_widget_migration()
+        rc, out, err = run_cli(self.url, 'up', '--lock',
+                               '-d', self.migdir)
+        self.assertEqual(rc, 0)
+
+        # Simulate a process killed while running a later migration.
+        db = SqliteDatabase(os.path.join(self.dir, 'cli.db'))
+        try:
+            db.execute_sql(
+                "INSERT INTO schema_migration (name, applied, state, "
+                "started_at, holder) VALUES ('0002_later', NULL, "
+                "'running', '2026-01-01 00:00:00', '7@ghost/ab12')")
+        finally:
+            db.close()
+
+        # status flags the entry distinctly and exits non-zero.
+        rc, out, err = run_cli(self.url, 'status', '--lock',
+                               '-d', self.migdir)
+        self.assertEqual(rc, 1)
+        self.assertIn('[~] 0002_later', out)
+        self.assertIn('7@ghost/ab12', out)
+
+        # plan reports the in-progress entry without writing.
+        rc, out, err = run_cli(self.url, 'plan', '--lock',
+                               '-d', self.migdir)
+        self.assertEqual(rc, 1)
+        self.assertIn('in progress: 0002_later', out)
+        self.assertIn('will skip: 0001_widget', out)
+
+        # The migration is not re-run without --force.
+        with open(os.path.join(self.migdir, '0002_later.py'), 'w') as fh:
+            fh.write("def up(migrator, db):\n    pass\n")
+        rc, out, err = run_cli(self.url, 'up', '--lock',
+                               '-d', self.migdir)
+        self.assertEqual(rc, 2)
+        self.assertIn('force=True', err)
 
     def test_cli_status_missing_file(self):
         os.makedirs(self.migdir)
